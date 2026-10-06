@@ -69,6 +69,20 @@ struct SMCParamStruct {
     )
 }
 
+// MARK: - SMC Reading
+
+/// The subset of SMC operations FanControl depends on. Abstracted so tests can inject a
+/// fake key table instead of touching hardware.
+public protocol SMCReading: AnyObject {
+    func readKey(_ key: String) -> (success: Bool, bytes: [UInt8], size: UInt32)
+    func writeKey(_ key: String, bytes: [UInt8]) -> Bool
+    func getKeyInfo(_ key: String) -> (size: UInt32, type: String)?
+    func getKeyCount() -> UInt32
+    func getKeyAtIndex(_ index: UInt32) -> String?
+    /// Forget any remembered key sizes, so the next read of each key re-asks the SMC.
+    func invalidateKeyCache()
+}
+
 // MARK: - SMC Connection
 
 /// Direct IOKit interface to the System Management Controller.
@@ -76,6 +90,12 @@ struct SMCParamStruct {
 public final class SMCConnection {
 
     private let connection: io_connect_t
+
+    /// Remembered key sizes (see SMCKeyInfoCache for what keeps this safe). Guarded by
+    /// `cacheLock`: the daemon and the app each touch one connection from more than one
+    /// thread. Only reads use it; writes always re-ask the SMC.
+    private let cacheLock = NSLock()
+    private var keyInfoCache = SMCKeyInfoCache()
 
     public init?() {
         var iterator: io_iterator_t = 0
@@ -110,9 +130,28 @@ public final class SMCConnection {
     public func readKey(_ key: String) -> (success: Bool, bytes: [UInt8], size: UInt32) {
         var input = SMCParamStruct()
         var output = SMCParamStruct()
+        let code = fourCharCode(key)
+        let now = ProcessInfo.processInfo.systemUptime
+
+        // Fast path: the size was confirmed recently, so one `readBytes` call is
+        // enough. Anything unexpected (a failed call, or the SMC reporting an error)
+        // drops the remembered size and falls through to the full path below, which
+        // re-validates the key exactly as every read used to.
+        if let cached = cachedSize(code, now: now) {
+            input.key = code
+            input.keyInfo.dataSize = cached
+            input.data8 = SMCCommand.readBytes.rawValue
+            if callSMC(&input, &output) == kIOReturnSuccess, output.result == 0 {
+                let bytes = withUnsafeBytes(of: output.bytes) { Array($0.prefix(Int(cached))) }
+                return (true, bytes, cached)
+            }
+            forgetSize(code)
+            input = SMCParamStruct()
+            output = SMCParamStruct()
+        }
 
         // Get key info (data size)
-        input.key = fourCharCode(key)
+        input.key = code
         input.data8 = SMCCommand.readKeyInfo.rawValue
         guard callSMC(&input, &output) == kIOReturnSuccess else {
             return (false, [], 0)
@@ -128,8 +167,19 @@ public final class SMCConnection {
             return (false, [], 0)
         }
 
+        // Remember the size only after a complete, error-free read, so absence and
+        // half-working keys are never cached.
+        if output.result == 0 { rememberSize(code, dataSize, now: now) }
+
         let bytes = withUnsafeBytes(of: output.bytes) { Array($0.prefix(Int(dataSize))) }
         return (true, bytes, dataSize)
+    }
+
+    /// Forget every remembered key size (after wake, or when the sensor set is re-probed).
+    public func invalidateKeyCache() {
+        cacheLock.lock()
+        keyInfoCache.invalidateAll()
+        cacheLock.unlock()
     }
 
     /// Write raw bytes to an SMC key
@@ -200,6 +250,24 @@ public final class SMCConnection {
 
     // MARK: - Private
 
+    private func cachedSize(_ code: UInt32, now: TimeInterval) -> UInt32? {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return keyInfoCache.size(for: code, now: now)
+    }
+
+    private func rememberSize(_ code: UInt32, _ size: UInt32, now: TimeInterval) {
+        cacheLock.lock()
+        keyInfoCache.store(size, for: code, now: now)
+        cacheLock.unlock()
+    }
+
+    private func forgetSize(_ code: UInt32) {
+        cacheLock.lock()
+        keyInfoCache.invalidate(code)
+        cacheLock.unlock()
+    }
+
     private func callSMC(_ input: inout SMCParamStruct, _ output: inout SMCParamStruct) -> kern_return_t {
         var outputSize = MemoryLayout<SMCParamStruct>.stride
         return IOConnectCallStructMethod(
@@ -242,6 +310,9 @@ public final class SMCConnection {
         )
     }
 }
+
+// SMCConnection's public methods already match SMCReading.
+extension SMCConnection: SMCReading {}
 
 // Type alias for the 32-byte tuple used in SMCParamStruct
 extension SMCParamStruct {

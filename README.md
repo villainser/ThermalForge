@@ -47,6 +47,8 @@ Tools like **Macs Fan Control** and **TG Pro** charge $15–$20 for fan control 
 
 - Real-time CPU, GPU, RAM, SSD, and ambient temperatures in the menu bar
 - Five fan profiles with proportional curves (not binary on/off)
+- Custom fan curves: draw your own temperature-to-speed curve with any number of points, keep several, edit and delete them ([details](docs/custom-fan-curves.md))
+- Adaptive polling: about once a second while the fans are being controlled, slower when the machine is quiet, and nothing is drawn while the menu is closed, so an idle ThermalForge costs a fraction of a percent of one core ([details](docs/adaptive-polling.md))
 - Thermal logging — CSV + JSON data export with process correlation for research
 - Automatic fan re-apply after sleep/wake
 - Fahrenheit / Celsius toggle
@@ -60,7 +62,7 @@ Tools like **Macs Fan Control** and **TG Pro** charge $15–$20 for fan control 
 
 Every profile uses a proportional curve with a per-profile curve shape — fans ramp gradually with temperature, not as binary switches. All profiles share a unified 50°C off threshold (matching Apple's observed behavior). Each profile has its own sustained trigger duration — fans only engage after temperature stays above the start threshold for a profile-specific number of seconds, filtering transient spikes that resolve on their own. Reacting to transient spikes would cause the start/stop cycling that is the #1 cause of fan bearing wear (source: [Analog Devices fan control](https://www.analog.com/en/analog-dialogue/articles/how-to-control-fan-speed.html)).
 
-Thermal polling runs at 100ms (matching Apple's own thermalmonitord cadence) for smooth fan transitions. Each profile has its own ramp rates and curve shape tuned to its purpose. Ramp governor design sourced from [MAX31760 datasheet](https://www.analog.com/media/en/technical-documentation/data-sheets/max31760.pdf) and [Microchip AN771](https://ww1.microchip.com/downloads/en/appnotes/00771a.pdf).
+Thermal polling is adaptive: about once a second while the fans are being controlled or anything is heating up (close to Apple's own thermalmonitord cadence), every 2 seconds while a profile holds a steady speed, and every 5 seconds for Silent when the machine is cool and quiet. It returns to once a second at once on a rise in temperature, at 85°C and above, and whenever the menu is open. Ramp rates and the sustained trigger are measured in real seconds, so a profile behaves the same at any poll rate ([the rules and what they cost](docs/adaptive-polling.md)). Each profile has its own ramp rates and curve shape tuned to its purpose. Ramp governor design sourced from [MAX31760 datasheet](https://www.analog.com/media/en/technical-documentation/data-sheets/max31760.pdf) and [Microchip AN771](https://ww1.microchip.com/downloads/en/appnotes/00771a.pdf).
 
 | Profile | Fans off | Fans start | Ceiling | Max fan | Curve | Sustained trigger | Behavior |
 |---|---|---|---|---|---|---|---|
@@ -77,6 +79,12 @@ Thermal polling runs at 100ms (matching Apple's own thermalmonitord cadence) for
 - **Between start and ceiling:** Fan speed scales based on the profile's curve shape. Balanced (ease-in) is quiet at low temps — at 62.5°C (midpoint of 55–70°C), fans run at only 15% of max RPM instead of 30% linear. Performance (linear) is proportional. Max has no proportional zone — it's binary.
 - **At ceiling and above:** Fan speed at the profile's maximum (60%/85%/100%).
 - **Ramp down:** Each profile has its own ramp-down rate. Max uses a gentle governor to let temps stabilize before backing off.
+
+## Custom Fan Curves
+
+Choose **Edit fan curves…** in the menu to draw your own curve: temperature on one axis, fan speed on the other, any number of points (2 to 16). Drag a point to move it, click to add one. A point's speed is a percentage of the fan's maximum RPM, and 0% means the fan's minimum RPM; the curve is interpolated between points and can never go below the hardware minimum or above its maximum. Save several curves, switch between them from the menu, edit them in place, delete them.
+
+A curve is its own mode next to the five profiles; it doesn't change them. Hysteresis, a cool-down delay and speed-up/slow-down limits keep the fans steady when the temperature wobbles by a degree or two. The 95°C safety override is checked before any curve on every poll, and the daemon's thermal floor still backs it up. See [docs/custom-fan-curves.md](docs/custom-fan-curves.md).
 
 ## Install
 
@@ -191,7 +199,7 @@ thermalforge max           # Max fans — no sudo when the daemon is running
 thermalforge auto          # Reset to Apple defaults
 thermalforge set 4000      # Set specific RPM — no sudo when the daemon is running
 thermalforge discover      # Dump all SMC keys (for new hardware)
-thermalforge watch         # Monitor mode with auto-boost profiles (requires sudo)
+thermalforge watch         # Monitor mode with auto-boost profiles, polls every 1s (requires sudo; -i SECONDS for a fixed rate)
 thermalforge log           # Record thermal data to CSV (1Hz, auto-delete 24h)
 thermalforge log --rate 10 --duration 1h --no-expire   # 10Hz for 1 hour, keep forever
 ```

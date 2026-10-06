@@ -451,6 +451,11 @@ public final class DaemonServer {
     /// and runs without head-of-line blocking in production.
     private let injectedSampler: (() -> Float?)?
 
+    /// Wake the thermal-floor and watchdog loops early. Both sleep long while nothing is
+    /// held (see DaemonLoopTiming) and are poked the moment a hold appears.
+    private let floorGate = WakeGate()
+    private let watchdogGate = WakeGate()
+
     /// Phase 4 connection layer (concurrent bounded accept + framed I/O), created in run().
     private var connectionServer: ConnectionServer?
     /// SIGTERM handler (#31), created in run(); kept so the source isn't released.
@@ -634,7 +639,12 @@ public final class DaemonServer {
     private func startHeartbeatWatchdog() {
         DispatchQueue.global(qos: .utility).async { [self] in
             while true {
-                Thread.sleep(forTimeInterval: 5)
+                // 5 s while a hold exists. With nothing held there is nothing to revert,
+                // so sleep long; a new hold pokes the gate and the loop runs at once.
+                stateLock.lock()
+                let holding = hold.command != nil
+                stateLock.unlock()
+                watchdogGate.wait(timeout: DaemonLoopTiming.watchdogInterval(holding: holding))
 
                 stateLock.lock()
                 let current = hold
@@ -742,14 +752,18 @@ public final class DaemonServer {
 
     // MARK: - Thermal Safety Floor
 
-    /// 1s cadence: the client monitor at 100ms is primary; this is a backstop, and
-    /// thermal mass doesn't move meaningfully in a second.
-    private static let thermalCadence: TimeInterval = 1.0
-
+    /// 1s cadence while a hold or an override is active: the client monitor is primary
+    /// (1 s while it controls the fans); this is a backstop that survives the app, and
+    /// thermal mass doesn't move meaningfully in a second. With nothing held it sleeps
+    /// long (see DaemonLoopTiming) and a new hold wakes it immediately.
     private func startThermalFloor() {
         DispatchQueue.global(qos: .utility).async { [self] in
             while true {
-                Thread.sleep(forTimeInterval: Self.thermalCadence)
+                stateLock.lock()
+                let holding = hold.command != nil
+                let suspended = safetySuspended
+                stateLock.unlock()
+                floorGate.wait(timeout: DaemonLoopTiming.floorInterval(holding: holding, suspended: suspended))
                 autoreleasepool { thermalTick() }
             }
         }
@@ -780,7 +794,8 @@ public final class DaemonServer {
         // managing thermals and there is nothing for the floor to override, so a reading
         // it could not act on is not safety. The floor exists for one case: ThermalForge
         // has pinned fans below what the machine needs and something has gone wrong. The
-        // client monitor at 100ms is the primary governor with its own override; this is
+        // client monitor (about every second while it controls the fans) is the primary
+        // governor with its own override; this is
         // the backstop that survives the app's death. So an idle daemon does zero SMC
         // work per tick — only a live below-max hold (or an active suspension) samples.
         stateLock.lock()
@@ -865,6 +880,12 @@ public final class DaemonServer {
     }
 
     private func handleWake() {
+        // Sensor answers and remembered key sizes may not survive a sleep: start the
+        // next reads from scratch rather than trust what was learned before it.
+        smcLock.lock()
+        fanControl.refreshHardwareCache()
+        smcLock.unlock()
+
         stateLock.lock()
         let heldCommand = hold.command
         stateLock.unlock()
@@ -902,16 +923,34 @@ public final class DaemonServer {
         guard request.v <= DaemonProtocol.version else {
             return .unsupported(daemonVersion: ThermalForgeVersion.current)
         }
-        smcLock.lock()
-        let response = process(request)
-        smcLock.unlock()
+        // heartbeat / state / version only read or refresh the hold under stateLock; they
+        // never touch the SMC. Taking smcLock for them made a liveness check wait behind a
+        // slow fan command, and logging them put three lines in the system log every few
+        // seconds, forever, as root. They run outside smcLock and are logged only when
+        // they fail. Every verb that can touch the SMC keeps the lock and its log line.
+        let touchesSMC: Bool
+        switch request.verb {
+        case .heartbeat, .state, .version: touchesSMC = false
+        default: touchesSMC = true
+        }
+        let response: DaemonResponse
+        if touchesSMC {
+            smcLock.lock()
+            response = process(request)
+            smcLock.unlock()
+        } else {
+            response = process(request)
+        }
         // Verb + outcome only — never raw client bytes.
-        DaemonLog.notice("ThermalForge daemon: verb=\(request.verb.rawValue) outcome=\(response.ok ? "ok" : (response.error?.rawValue ?? "error"))")
+        if touchesSMC || !response.ok {
+            DaemonLog.notice("ThermalForge daemon: verb=\(request.verb.rawValue) outcome=\(response.ok ? "ok" : (response.error?.rawValue ?? "error"))")
+        }
         return response
     }
 
     /// The full request dispatch — MOVED VERBATIM from the pre-Phase-4 serial handler.
-    /// The CALLER holds smcLock for the whole call, so every check-then-act
+    /// The CALLER holds smcLock for the whole call (except for heartbeat / state / version,
+    /// which never touch the SMC and use only stateLock), so every check-then-act
     /// (blockedByCLIHold, rate limit, clamp, recordHold + SMC write) stays atomic exactly
     /// as before; Phase 4 concurrency lives only in the I/O around this, never inside it.
     /// Same-class concurrent writers resolve by last-write-wins (recordHold overwrites) —
@@ -929,10 +968,18 @@ public final class DaemonServer {
             // re-apply (handleWake) and the `state` snapshot are unchanged.
             func recordHold(_ heldCommand: String) {
                 stateLock.lock()
+                let wasIdle = hold.command == nil && !safetySuspended
                 hold = oneshot
                     ? .unsupervised(command: heldCommand)
                     : .supervised(command: heldCommand, lastBeat: Date())
                 stateLock.unlock()
+                // Nothing was held until now, so the floor and the watchdog may be in
+                // their long idle sleep: wake them so this hold is watched from the
+                // start. Only on that transition, not on every command of a ramp.
+                if wasIdle {
+                    floorGate.poke()
+                    watchdogGate.poke()
+                }
             }
 
             // A supervised (app) command must NOT silently overwrite an unsupervised

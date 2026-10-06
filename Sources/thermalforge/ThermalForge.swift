@@ -354,8 +354,8 @@ struct Watch: ParsableCommand {
     @Option(name: .shortAndLong, help: "Profile: silent, balanced, performance, max")
     var profile: String = "balanced"
 
-    @Option(name: .shortAndLong, help: "Poll interval in seconds (default 0.1 = 100ms)")
-    var interval: Double = 0.1
+    @Option(name: .shortAndLong, help: "Poll interval in seconds, held fixed (default 1 = once a second)")
+    var interval: Double?
 
     @Flag(name: .long, help: "Output JSON on each update")
     var json: Bool = false
@@ -374,7 +374,8 @@ struct Watch: ParsableCommand {
 
         print("ThermalForge watch — profile: \(selectedProfile.name)")
         print("Hardware: \(fc.hardwareInfo)")
-        print("Polling every \(interval)s. Ctrl-C to stop.\n")
+        let pollInterval = interval ?? 1.0
+        print("Polling every \(pollInterval)s. Ctrl-C to stop.\n")
 
         // CLI runs as root, so fan commands go directly through FanControl
         monitor.onFanCommand = { command in
@@ -424,7 +425,8 @@ struct Watch: ParsableCommand {
             Darwin.exit(0)
         }
 
-        monitor.start(interval: interval)
+        // Fixed rate: `watch` prints every update, so there's nothing to relax.
+        monitor.start(interval: pollInterval, adaptive: false)
 
         // Keep the process alive
         RunLoop.main.run()

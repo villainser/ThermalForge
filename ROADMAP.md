@@ -55,6 +55,8 @@ Apple's fan hardware behavior (sources: macos-smc-fan reverse engineering, Tunab
 
 ### Dual-cadence architecture
 
+> **Superseded.** The tick is no longer a fixed 100ms: polling is adaptive (1s / 2s / 5s, see [docs/adaptive-polling.md](docs/adaptive-polling.md)) and the cadences below are measured in seconds, not ticks. This section is kept as the record of the original design.
+
 Thermal polling now runs at 100ms (matching Apple's thermalmonitord) for smooth fan transitions. Heavy operations run at a slower 2-second cadence to avoid overhead:
 
 | Cadence | Interval | Operations |

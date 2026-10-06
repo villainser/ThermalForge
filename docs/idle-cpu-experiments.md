@@ -1,5 +1,14 @@
 # ThermalForge Idle CPU: Method and Evidence
 
+> **Update.** The conclusion below ("nothing to change", and the guarantees it chose to keep:
+> 100 ms polling, every key validated on every read, every sensor read every time) was later
+> revisited. [adaptive-polling.md](adaptive-polling.md) describes what replaced it: adaptive polling
+> rates, remembered key sizes with bounded re-validation, a lighter read while the menu is closed,
+> and a quiet daemon at idle, and which parts of the guarantees were kept in a bounded form. The
+> measurements and the method here are unchanged and are still how to measure it
+> (`Scripts/measure-idle-cpu.sh` automates the `ps` method). Read what follows as the investigation
+> that identified where the CPU goes, not as the current design.
+
 ## Summary in plain language
 
 ThermalForge uses roughly **4% of one CPU core** while it is just sitting in the menu bar
