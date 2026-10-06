@@ -1,5 +1,7 @@
 # Profile Redesign Build Plan
 
+> **Historical.** This is the original design plan. Where it says 100ms ticks or counts ticks, the implementation has since moved to adaptive polling with wall-clock timing; see [docs/adaptive-polling.md](docs/adaptive-polling.md).
+
 ## Infrastructure Change: Dual-Cadence Tick
 
 **`ThermalMonitor.swift`** — split the single 2s tick into two cadences:

@@ -121,6 +121,55 @@ public enum HeartbeatWatchdog {
     }
 }
 
+/// How long the daemon's background loops sleep between checks, by whether there is
+/// anything for them to watch. With no hold, fans are on Apple's own curve and neither
+/// the thermal floor nor the watchdog has anything to do, so an idle daemon sleeps long
+/// and costs nearly nothing. A new hold wakes them at once (`WakeGate.poke()`), so the
+/// long sleep never delays protection for a hold that has just been set.
+public enum DaemonLoopTiming {
+    /// Thermal floor while a hold or an override is active.
+    public static let floorActive: TimeInterval = 1.0
+    /// Thermal floor with nothing held.
+    public static let floorIdle: TimeInterval = 10.0
+    /// Heartbeat watchdog while a hold exists.
+    public static let watchdogActive: TimeInterval = 5.0
+    /// Heartbeat watchdog with nothing held.
+    public static let watchdogIdle: TimeInterval = 30.0
+
+    public static func floorInterval(holding: Bool, suspended: Bool) -> TimeInterval {
+        (holding || suspended) ? floorActive : floorIdle
+    }
+
+    public static func watchdogInterval(holding: Bool) -> TimeInterval {
+        holding ? watchdogActive : watchdogIdle
+    }
+}
+
+/// A sleep that can be cut short. `wait(timeout:)` returns when the timeout passes OR
+/// as soon as `poke()` is called (even if the poke came just before the wait began, so
+/// a wake-up is never lost). A spurious early return is harmless: the loops that use
+/// this just run their check once sooner.
+final class WakeGate {
+    private let condition = NSCondition()
+    private var poked = false
+
+    func wait(timeout: TimeInterval) {
+        condition.lock()
+        if !poked {
+            _ = condition.wait(until: Date(timeIntervalSinceNow: timeout))
+        }
+        poked = false
+        condition.unlock()
+    }
+
+    func poke() {
+        condition.lock()
+        poked = true
+        condition.signal()
+        condition.unlock()
+    }
+}
+
 /// What the daemon does on SIGTERM (a bootout, or a manual kill): release the
 /// fans only if it was controlling them, so it never touches fans it doesn't own.
 public enum DaemonShutdown {

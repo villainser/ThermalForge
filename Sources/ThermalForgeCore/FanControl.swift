@@ -41,11 +41,11 @@ public struct FanInfo {
     public let mode: String
 }
 
-public struct ThermalStatus: Encodable {
+public struct ThermalStatus: Encodable, Equatable {
     public let fans: [FanStatus]
     public let temperatures: [String: Float]
 
-    public struct FanStatus: Encodable {
+    public struct FanStatus: Encodable, Equatable {
         public let index: Int
         public let actualRPM: Int
         public let targetRPM: Int
@@ -79,7 +79,7 @@ public struct DiscoveredKey {
 // MARK: - Fan Control
 
 public final class FanControl {
-    private let smc: SMCConnection
+    private let smc: SMCReading
     /// Which mode key works on this hardware (detected at init)
     private let modeKeyTemplate: String
     /// Whether Ftst unlock is available (M1-M4) or not (M5+)
@@ -89,11 +89,43 @@ public final class FanControl {
     /// sets this so its lines carry the daemon's own prefix.
     var logSink: ((String) -> Void)?
 
-    public init() throws {
+    // Hardware facts that don't change while the machine is up, read once and kept.
+    // Guarded by `cacheLock`: the daemon reaches one FanControl from several threads,
+    // the app from the monitor queue.
+    private let cacheLock = NSLock()
+    private var cachedFanCount: Int?
+    private var cachedLimits: [Int: (min: Float, max: Float)] = [:]
+    private var sensorProbe: SensorProbe?
+
+    /// Which of `thermalKeys` answer on this machine, from the last probe.
+    private struct SensorProbe {
+        var live: [String]
+        var absent: [String]
+        var probedAt: TimeInterval
+    }
+
+    /// How often the keys that were absent at the last probe are asked about again.
+    /// A sensor that failed once (at startup, or around a wake) must come back; it is
+    /// never dropped for the life of the process.
+    static let sensorReprobeInterval: TimeInterval = 300
+    /// Nothing answered at all: look again sooner.
+    static let sensorReprobeIntervalWhenEmpty: TimeInterval = 5
+
+    /// The clock the sensor re-probe schedule runs on (monotonic seconds). Tests
+    /// substitute their own so the five-minute interval doesn't have to be waited out.
+    var sensorClock: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+
+    /// A FanControl backed by the real SMC. Throws if there is none.
+    public convenience init() throws {
         guard let connection = SMCConnection() else {
             throw ThermalForgeError.smcConnectionFailed
         }
-        self.smc = connection
+        self.init(smc: connection)
+    }
+
+    /// Any SMC backend: the real one, or a fake key table in tests.
+    public init(smc: SMCReading) {
+        self.smc = smc
 
         // Detect hardware: which mode key exists?
         // M5 Max uses F%dmd (lowercase), M1-M4 use F%dMd (uppercase)
@@ -114,12 +146,22 @@ public final class FanControl {
 
     // MARK: - Fan Count
 
+    /// The number of fans. A hardware constant, read once; a failed read isn't kept.
     public func fanCount() throws -> Int {
+        cacheLock.lock()
+        let cached = cachedFanCount
+        cacheLock.unlock()
+        if let cached { return cached }
+
         let result = smc.readKey(SMCFanKey.count)
         guard result.success, !result.bytes.isEmpty else {
             throw ThermalForgeError.readFailed(SMCFanKey.count)
         }
-        return Int(result.bytes[0])
+        let count = Int(result.bytes[0])
+        cacheLock.lock()
+        cachedFanCount = count
+        cacheLock.unlock()
+        return count
     }
 
     // MARK: - Read Fan Info
@@ -127,28 +169,55 @@ public final class FanControl {
     public func fanInfo(_ index: Int) throws -> FanInfo {
         let actual = readFanFloat(index, template: SMCFanKey.actual)
         let target = readFanFloat(index, template: SMCFanKey.target)
-        let minimum = readFanFloat(index, template: SMCFanKey.minimum)
-        let maximum = readFanFloat(index, template: SMCFanKey.maximum)
-
-        let modeKey = SMCFanKey.key(modeKeyTemplate, fan: index)
-        let modeResult = smc.readKey(modeKey)
-        let modeValue = modeResult.success && !modeResult.bytes.isEmpty ? modeResult.bytes[0] : 0
-        let mode: String
-        switch modeValue {
-        case 0: mode = "auto"
-        case 1: mode = "manual"
-        case 3: mode = "system"
-        default: mode = "unknown(\(modeValue))"
-        }
+        let limits = fanLimits(index)
 
         return FanInfo(
             index: index,
             actualRPM: actual,
             targetRPM: target,
-            minRPM: minimum,
-            maxRPM: maximum,
-            mode: mode
+            minRPM: limits.min,
+            maxRPM: limits.max,
+            mode: readMode(index)
         )
+    }
+
+    /// A fan's [min, max] RPM are firmware constants: read once, then kept. Only kept
+    /// once a valid maximum (> 0) was seen, so a zero from a failed read at startup is
+    /// never latched. These bound every speed we ever set, so they are the one thing
+    /// here we'd rather re-read than trust a bad value.
+    private func fanLimits(_ index: Int) -> (min: Float, max: Float) {
+        cacheLock.lock()
+        let cached = cachedLimits[index]
+        cacheLock.unlock()
+        if let cached { return cached }
+
+        let minimum = readFanFloat(index, template: SMCFanKey.minimum)
+        let maximum = readFanFloat(index, template: SMCFanKey.maximum)
+        if maximum > 0 {
+            cacheLock.lock()
+            cachedLimits[index] = (minimum, maximum)
+            cacheLock.unlock()
+        }
+        return (minimum, maximum)
+    }
+
+    /// Min/max RPM of the primary fan (fan 0), kept after the first read. Falls back to
+    /// the typical Apple Silicon range when there is no fan or the limits read as zero.
+    public func primaryFanLimits() -> (minRPM: Float, maxRPM: Float) {
+        guard let count = try? fanCount(), count > 0 else { return (2317, 7826) }
+        let limits = fanLimits(0)
+        return (limits.min > 0 ? limits.min : 2317, limits.max > 0 ? limits.max : 7826)
+    }
+
+    private func readMode(_ index: Int) -> String {
+        let modeResult = smc.readKey(SMCFanKey.key(modeKeyTemplate, fan: index))
+        let modeValue = modeResult.success && !modeResult.bytes.isEmpty ? modeResult.bytes[0] : 0
+        switch modeValue {
+        case 0: return "auto"
+        case 1: return "manual"
+        case 3: return "system"
+        default: return "unknown(\(modeValue))"
+        }
     }
 
     // MARK: - Unlock
@@ -157,6 +226,13 @@ public final class FanControl {
     /// On M1-M4: writes Ftst=1, then polls until mode write succeeds.
     /// On M5+: Ftst doesn't exist, attempts direct mode write.
     private func unlockFans(count: Int) throws {
+        // Already unlocked by an earlier command: every fan is in manual mode and, where
+        // it exists, Ftst is still set. Re-running the unlock would write Ftst again and
+        // sleep half a second on EVERY speed change. Both are read from the SMC here, so
+        // if the system took the fans back (mode no longer manual, or Ftst cleared) this
+        // is false and the full unlock below runs.
+        if allFansUnlocked(count: count) { return }
+
         if hasFtst {
             // M1-M4 path: Ftst unlock suppresses thermalmonitord
             guard smc.writeKey(SMCFanKey.forceTest, bytes: [1]) else {
@@ -187,6 +263,17 @@ public final class FanControl {
                 )
             }
         }
+    }
+
+    /// True when manual control is already fully in place (see `unlockFans`).
+    private func allFansUnlocked(count: Int) -> Bool {
+        guard count > 0 else { return false }
+        for i in 0..<count where readMode(i) != "manual" { return false }
+        if hasFtst {
+            let ftst = smc.readKey(SMCFanKey.forceTest)
+            guard ftst.success, let value = ftst.bytes.first, value != 0 else { return false }
+        }
+        return true
     }
 
     /// Unlock a single fan for manual control
@@ -410,18 +497,100 @@ public final class FanControl {
             ))
         }
 
-        // Probe temperature keys across all known Apple Silicon generations.
-        // Keys that don't exist on a given machine are skipped automatically.
+        // Read the temperature keys known across all Apple Silicon generations. Keys
+        // that don't exist on this machine are found once (and re-checked every few
+        // minutes, see `liveTemperatureKeys`) and not asked about on every read.
         // Labels use the raw SMC key name — no assumptions about what a key
-        // means on hardware we haven't verified.
-        // Probe every known thermal key (flt/ioft decoded by size in readTemp). Keys
-        // that don't exist on this machine return nil and are skipped.
+        // means on hardware we haven't verified. flt/ioft is decoded by size in readTemp.
         var temps: [String: Float] = [:]
-        for key in Self.thermalKeys {
+        for key in liveTemperatureKeys() {
             if let t = readTemp(key) { temps[key] = t }
         }
 
         return ThermalStatus(fans: fans, temperatures: temps)
+    }
+
+    // MARK: - Control read and sensor probe
+
+    private static let safetyKeySet: Set<String> = Set(safetyTempKeys)
+
+    /// The cheap read for the control loop: the peak CPU and the peak GPU temperature,
+    /// and nothing else. Skips the display-only sensors (memory, SSD, ambient, …) and
+    /// every fan read. nil when no CPU or GPU sensor could be read, which the caller
+    /// treats as a failed tick; the sensor probe is then re-run at its next chance.
+    public func controlTemps() -> (cpu: Float, gpu: Float)? {
+        var cpu: Float = 0
+        var gpu: Float = 0
+        var read = false
+        for key in liveTemperatureKeys() where Self.safetyKeySet.contains(key) {
+            guard let t = readTemp(key) else { continue }
+            read = true
+            if key.hasPrefix("TC") || key.hasPrefix("Tp") {
+                cpu = max(cpu, t)
+            } else {
+                gpu = max(gpu, t)
+            }
+        }
+        if !read { markSensorProbeStale() }
+        return read ? (cpu, gpu) : nil
+    }
+
+    /// The thermal keys that answer on this machine. Probed once on first use; after
+    /// that, only the keys that did NOT answer are asked about again, every
+    /// `sensorReprobeInterval`, so a sensor that failed at startup or around a wake
+    /// comes back instead of being dropped until the process restarts. Keys that
+    /// answered stay in the set; one that misreads on a given tick is simply skipped
+    /// that tick and tried again on the next.
+    private func liveTemperatureKeys() -> [String] {
+        let now = sensorClock()
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+
+        if var probe = sensorProbe {
+            let wait = probe.live.isEmpty ? Self.sensorReprobeIntervalWhenEmpty : Self.sensorReprobeInterval
+            let due = now - probe.probedAt >= wait && (probe.live.isEmpty || !probe.absent.isEmpty)
+            guard due else { return probe.live }
+
+            let pool = probe.live.isEmpty ? Self.thermalKeys : probe.absent
+            var answered = Set(probe.live)
+            var stillAbsent: [String] = []
+            for key in pool {
+                if readTemp(key) != nil { answered.insert(key) } else { stillAbsent.append(key) }
+            }
+            probe.live = Self.thermalKeys.filter { answered.contains($0) }
+            probe.absent = stillAbsent
+            probe.probedAt = now
+            sensorProbe = probe
+            return probe.live
+        }
+
+        var live: [String] = []
+        var absent: [String] = []
+        for key in Self.thermalKeys {
+            if readTemp(key) != nil { live.append(key) } else { absent.append(key) }
+        }
+        sensorProbe = SensorProbe(live: live, absent: absent, probedAt: now)
+        return live
+    }
+
+    /// Make the next `liveTemperatureKeys()` re-check the absent keys now.
+    private func markSensorProbeStale() {
+        cacheLock.lock()
+        if var probe = sensorProbe {
+            probe.probedAt = -.infinity
+            sensorProbe = probe
+        }
+        cacheLock.unlock()
+    }
+
+    /// Drop what was learned about this machine's sensors and remembered key sizes, so
+    /// the next reads start from scratch (the daemon calls this on wake). Fan count and
+    /// limits are hardware constants and are kept.
+    public func refreshHardwareCache() {
+        cacheLock.lock()
+        sensorProbe = nil
+        cacheLock.unlock()
+        smc.invalidateKeyCache()
     }
 
     // MARK: - Discover

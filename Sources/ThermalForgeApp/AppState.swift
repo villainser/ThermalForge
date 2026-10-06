@@ -9,12 +9,61 @@ import ServiceManagement
 import SwiftUI
 @preconcurrency import ThermalForgeCore
 
+/// Heartbeat state shared between the main actor and the heartbeat queue (the timer's
+/// handler runs off the main actor): whether the timer is in its fast mode, and when the
+/// daemon's version was last read. Behind a lock, so the handler never mutates a captured
+/// local.
+private final class HeartbeatMode: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isFast = true
+    private var versionReadAt = Date.distantPast
+
+    var fast: Bool {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return isFast
+        }
+        set {
+            lock.lock()
+            isFast = newValue
+            lock.unlock()
+        }
+    }
+
+    /// True when the version hasn't been read for at least `seconds`.
+    func versionIsDue(after seconds: TimeInterval) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return Date().timeIntervalSince(versionReadAt) >= seconds
+    }
+
+    func markVersionRead() {
+        lock.lock()
+        versionReadAt = Date()
+        lock.unlock()
+    }
+}
+
 @MainActor
 final class AppState: ObservableObject {
+    /// The full status, fed to the dropdown. Only published while the dropdown is open:
+    /// the panel's hosting view stays alive while hidden and re-renders on every change
+    /// it observes, so feeding it a new status every poll drew a view nobody could see.
     @Published var latestStatus: ThermalStatus?
     @Published var activeProfile: FanProfile = .silent
-    @Published var monitorState: MonitorState = .idle
+    @Published var monitorState: MonitorState = .idle {
+        didSet { retuneHeartbeat() }
+    }
+    /// Peak CPU/GPU temperature in whole degrees, for the menu bar label. Whole degrees
+    /// because the label shows an integer: a jittering tenth would redraw it for nothing.
     @Published var maxTemp: Float?
+    /// The user's custom fan curves, kept in step with what's on disk.
+    @Published var customCurves: [CustomFanCurve] = []
+    /// The primary fan's hardware RPM range, read once at launch (typical Apple Silicon
+    /// values until then). The curve editor shows it so a curve is drawn against what
+    /// the hardware can really do.
+    private(set) var fanLimits: (minRPM: Float, maxRPM: Float) = (2317, 7826)
     @Published var useFahrenheit: Bool = UserDefaults.standard.bool(forKey: "useFahrenheit") {
         didSet { UserDefaults.standard.set(useFahrenheit, forKey: "useFahrenheit") }
     }
@@ -49,9 +98,23 @@ final class AppState: ObservableObject {
 
     private var monitor: ThermalMonitor?
     private let executor = PrivilegedExecutor()
+    private let curveStore = CustomCurveStore()
     private var heartbeatTimer: DispatchSourceTimer?
+    private let heartbeatMode = HeartbeatMode()
     /// Consecutive failed heartbeats, for debouncing `daemonUnreachable`.
     private var heartbeatFailures = 0
+    /// Whether the dropdown panel is on screen (reported by the view).
+    private var panelVisible = false
+
+    /// Heartbeat period while the app controls the fans or the menu is open. The daemon's
+    /// watchdog reverts a supervised hold after 15 s of silence, so this must stay well
+    /// under that whenever there IS a hold.
+    private static let fastHeartbeatSeconds: TimeInterval = 5
+    /// Heartbeat period when nothing is held and the menu is closed: only a liveness and
+    /// CLI-hold check, there is no hold to keep alive.
+    private static let idleHeartbeatSeconds: TimeInterval = 30
+    /// How often the daemon's version is re-read (it only changes on a reinstall).
+    private static let versionCheckSeconds: TimeInterval = 300
 
     /// Runs the 5s heartbeat/version/state polls OFF the main thread so a slow
     /// or hung daemon can never stall the UI run loop (the v0.1.7 freeze).
@@ -91,6 +154,9 @@ final class AppState: ObservableObject {
 
         // Show a previously-found update immediately, before any network call.
         availableUpdate = Self.storedAvailableUpdate()
+
+        // Custom curves first: launch restore may need to find the one that was active.
+        reloadCustomCurves()
 
         adoptDaemonStateOnLaunch()
 
@@ -162,9 +228,14 @@ final class AppState: ObservableObject {
                 // running comes back to Smart. Deferred to here so the hold state is known
                 // before any fan command is issued (no pre-adopt commands in the window).
                 if adopted == nil {
-                    let restored = self.restoredProfile()
-                    self.activeProfile = restored
-                    self.monitor?.switchProfile(restored)
+                    if let curve = self.restoredCustomCurve() {
+                        self.activeProfile = FanProfile(custom: curve)
+                        self.monitor?.switchToCustom(curve)
+                    } else {
+                        let restored = self.restoredProfile()
+                        self.activeProfile = restored
+                        self.monitor?.switchProfile(restored)
+                    }
                 }
                 // Ordering gate: only now that adopt has applied the launch state
                 // do we start the heartbeat. This makes adopt's externalHold write
@@ -183,10 +254,21 @@ final class AppState: ObservableObject {
 
     // MARK: - Heartbeat
 
+    /// Fast (5 s) while the app controls the fans or the menu is open; slow (30 s) when
+    /// nothing is held and the menu is closed, since then there is no hold to keep alive.
+    private var wantsFastHeartbeat: Bool {
+        panelVisible || monitorState != .idle
+    }
+
     private func startHeartbeat() {
         let client = DaemonClient()
+        let mode = heartbeatMode
+        let fast = wantsFastHeartbeat
+        mode.fast = fast
+        let period = fast ? Self.fastHeartbeatSeconds : Self.idleHeartbeatSeconds
+        let versionEvery = Self.versionCheckSeconds
         let timer = DispatchSource.makeTimerSource(queue: heartbeatQueue)
-        timer.schedule(deadline: .now() + 5, repeating: 5)
+        timer.schedule(deadline: .now() + 5, repeating: period, leeway: .seconds(1))
         timer.setEventHandler { [weak self] in
             // Runs OFF the main thread. Each socket round-trip is bounded by the
             // request timeout, so a hung daemon can no longer stall the UI.
@@ -194,30 +276,40 @@ final class AppState: ObservableObject {
             // Heartbeat is NOT advisory: it refreshes the supervised hold's
             // liveness and the daemon watchdog reverts after 15s of silence. One
             // immediate retry absorbs a transient blip without waiting a full 5s
-            // for the next tick.
-            let firstBeat = (try? client.request(DaemonRequest(verb: .heartbeat)))?.ok == true
-            let hbOK = firstBeat || ((try? client.request(DaemonRequest(verb: .heartbeat)))?.ok == true)
+            // for the next tick. Sent in fast mode (the app controls the fans, or the
+            // menu is open); in slow mode there is no hold to keep alive, and the
+            // state read below doubles as the liveness check.
+            let beating = mode.fast
+            var hbOK = false
+            if beating {
+                let firstBeat = (try? client.request(DaemonRequest(verb: .heartbeat)))?.ok == true
+                hbOK = firstBeat || ((try? client.request(DaemonRequest(verb: .heartbeat)))?.ok == true)
+            }
 
             // Advisory: version + state. On failure/timeout DON'T assert — leave
             // the last known value untouched rather than clearing the banner on a
             // transient blip. Only a definitive read updates published state. Both
             // the `version` reply and an `unsupportedVersion` reply carry the
             // daemon's build; a reply without one is treated as an older build.
-            let didReadVersion: Bool
-            let versionValue: String?
-            do {
-                let response = try client.request(DaemonRequest(verb: .version))
-                let daemonVersion = response.version ?? "an older build"
-                versionValue = (daemonVersion == ThermalForgeVersion.current) ? nil : daemonVersion
-                didReadVersion = true
-            } catch DaemonError.incompatibleDaemon {
-                // Legacy (pre-Phase-2) daemon in the upgrade window → show the
-                // update-needed banner rather than leaving it stale.
-                versionValue = "an older build"
-                didReadVersion = true
-            } catch {
-                versionValue = nil
-                didReadVersion = false
+            // The version only changes on a reinstall, so it is re-read every few
+            // minutes, not every beat.
+            var didReadVersion = false
+            var versionValue: String?
+            if mode.versionIsDue(after: versionEvery) {
+                do {
+                    let response = try client.request(DaemonRequest(verb: .version))
+                    let daemonVersion = response.version ?? "an older build"
+                    versionValue = (daemonVersion == ThermalForgeVersion.current) ? nil : daemonVersion
+                    didReadVersion = true
+                } catch DaemonError.incompatibleDaemon {
+                    // Legacy (pre-Phase-2) daemon in the upgrade window → show the
+                    // update-needed banner rather than leaving it stale.
+                    versionValue = "an older build"
+                    didReadVersion = true
+                } catch {
+                    // Unreadable: keep the last value and try again next beat.
+                }
+                if didReadVersion { mode.markVersionRead() }
             }
 
             // Poll the daemon's hold so a CLI hold set out-of-band shows up in the
@@ -233,19 +325,29 @@ final class AppState: ObservableObject {
                 didReadState = false
             }
 
+            let reachable = beating ? hbOK : didReadState
+            let readVersion = didReadVersion
+            let newVersion = versionValue
+
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                if didReadVersion { self.daemonVersionMismatch = versionValue }
-                if didReadState { self.externalHold = holdValue }
+                // Assign only on a real change: every @Published write wakes the
+                // dropdown's hosting view, even when the value is the same.
+                if readVersion, self.daemonVersionMismatch != newVersion {
+                    self.daemonVersionMismatch = newVersion
+                }
+                if didReadState, self.externalHold != holdValue {
+                    self.externalHold = holdValue
+                }
                 // Daemon reachability — debounced so a single blip doesn't flash the
-                // "fan control unavailable" banner. Two consecutive missed heartbeats
-                // (~10s) is a real outage; any success clears it immediately.
-                if hbOK {
+                // "fan control unavailable" banner. Two consecutive misses is a real
+                // outage (~10s in fast mode); any success clears it immediately.
+                if reachable {
                     self.heartbeatFailures = 0
-                    self.daemonUnreachable = false
+                    if self.daemonUnreachable { self.daemonUnreachable = false }
                 } else {
                     self.heartbeatFailures += 1
-                    if self.heartbeatFailures >= 2 { self.daemonUnreachable = true }
+                    if self.heartbeatFailures >= 2, !self.daemonUnreachable { self.daemonUnreachable = true }
                 }
             }
 
@@ -255,6 +357,19 @@ final class AppState: ObservableObject {
         }
         timer.resume()
         heartbeatTimer = timer
+    }
+
+    /// Switch the heartbeat between its fast and slow period when the answer to
+    /// `wantsFastHeartbeat` changes. Going fast fires almost at once, so a menu that
+    /// has just opened shows fresh banners, and a hold that has just begun is kept
+    /// alive.
+    private func retuneHeartbeat() {
+        let fast = wantsFastHeartbeat
+        guard fast != heartbeatMode.fast else { return }
+        heartbeatMode.fast = fast
+        guard let timer = heartbeatTimer else { return }
+        let period = fast ? Self.fastHeartbeatSeconds : Self.idleHeartbeatSeconds
+        timer.schedule(deadline: .now() + (fast ? 0.2 : period), repeating: period, leeway: .seconds(1))
     }
 
     // MARK: - Update check
@@ -342,18 +457,33 @@ final class AppState: ObservableObject {
     func startMonitoring() {
         guard let fc = try? FanControl() else { return }
 
+        fanLimits = fc.primaryFanLimits()
+
         let monitor = ThermalMonitor(fanControl: fc, profile: activeProfile)
-        monitor.onUpdate = { [weak self] status, profile, state in
+        // Nothing shows live readings until the dropdown opens: with this false the
+        // monitor reads only the CPU/GPU sensors and its poll rate may relax.
+        monitor.fullStatusWanted = panelVisible
+
+        // The menu bar label: the peak CPU/GPU temperature in whole degrees (the same
+        // sensors, TC/Tp/TG/Tg, the old per-update max used) and the monitor state.
+        // The monitor only calls this when one of them changed, and each is assigned
+        // only if it differs, so a steady machine publishes nothing at all. The profile
+        // is deliberately NOT echoed back from here: AppState sets it itself on every
+        // selection, and a late echo could undo a click.
+        monitor.onPeakUpdate = { [weak self] peak, _, state in
             Task { @MainActor [weak self] in
-                self?.latestStatus = status
-                self?.activeProfile = profile
-                self?.monitorState = state
-                // Max of only the displayed sensors
-                // Peak across all CPU and GPU sensors for menu bar display
-                let displayPrefixes = ["TC", "Tp", "TG", "Tg"]
-                self?.maxTemp = status.temperatures
-                    .filter { key, _ in displayPrefixes.contains(where: { key.hasPrefix($0) }) }
-                    .values.max()
+                guard let self else { return }
+                if self.maxTemp != peak { self.maxTemp = peak }
+                if self.monitorState != state { self.monitorState = state }
+            }
+        }
+        // The full status, for the dropdown. The monitor builds it only while the panel
+        // is open; the guard here covers an update that was already in flight when the
+        // panel closed.
+        monitor.onUpdate = { [weak self] status, _, _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.panelVisible, self.latestStatus != status else { return }
+                self.latestStatus = status
             }
         }
         monitor.onFanCommand = { [weak self] command in
@@ -374,6 +504,74 @@ final class AppState: ObservableObject {
         self.monitor = monitor
     }
 
+    // MARK: - Dropdown visibility
+
+    /// Called by the dropdown's view when its panel appears or disappears. While it is
+    /// hidden, nothing shows live readings, so the monitor stops building the full status
+    /// and the poll rate may relax. When it opens, the monitor polls at once, so the menu
+    /// never sits on "Reading sensors…" waiting out a slow idle interval.
+    func setPanelVisible(_ visible: Bool) {
+        guard visible != panelVisible else { return }
+        panelVisible = visible
+        monitor?.fullStatusWanted = visible
+        if visible { monitor?.refreshNow() }
+        retuneHeartbeat()
+    }
+
+    // MARK: - Custom curves
+
+    /// Re-read the curves from disk. A file that doesn't validate is skipped and logged,
+    /// never half-applied.
+    func reloadCustomCurves() {
+        customCurves = curveStore.loadAll { TFLogger.shared.error("Custom curve skipped — \($0)") }
+    }
+
+    /// The custom curve that was the active profile when the app last ran, if it still exists.
+    private func restoredCustomCurve() -> CustomFanCurve? {
+        guard let id = UserDefaults.standard.string(forKey: Self.selectedProfileKey) else { return nil }
+        return customCurves.first { $0.id == id }
+    }
+
+    /// Make a custom curve the active profile. A mode next to the built-in profiles,
+    /// not a replacement for them. The fans are handed back to the system first, so the
+    /// curve engages from a clean state, whatever the previous profile left them at.
+    func selectCustom(_ curve: CustomFanCurve) {
+        seizeControl()
+        activeProfile = FanProfile(custom: curve)
+        persistSelectedProfile(curve.id)
+        monitor?.switchToCustom(curve)
+        commandPump.submit(.resetAuto)
+        TFLogger.shared.profile("Selected custom curve: \(curve.name)")
+    }
+
+    /// Save a curve (new or edited). If it is the one running, the running curve is
+    /// updated in place, keeping its speed, so the fans don't glitch mid-edit.
+    @discardableResult
+    func saveCurve(_ curve: CustomFanCurve) throws -> CustomFanCurve {
+        let saved = try curveStore.save(curve)
+        reloadCustomCurves()
+        if activeProfile.id == saved.id {
+            activeProfile = FanProfile(custom: saved)
+            monitor?.switchToCustom(saved, preservingState: true)
+        }
+        TFLogger.shared.profile("Saved custom curve: \(saved.name)")
+        return saved
+    }
+
+    /// Delete a curve. If it was the active profile the fans go back to the system
+    /// (Default), exactly as if the user had pressed Default.
+    func deleteCurve(id: String) {
+        let wasActive = activeProfile.id == id
+        do {
+            try curveStore.delete(id: id)
+        } catch {
+            TFLogger.shared.error("Deleting custom curve failed: \(error)")
+            return
+        }
+        reloadCustomCurves()
+        if wasActive { resetAuto() }
+    }
+
     // MARK: - Actions
 
     /// Explicit user takeover of any reflected CLI hold. Returns whether one was
@@ -387,7 +585,7 @@ final class AppState: ObservableObject {
     }
 
     func setSmart() {
-        let took = seizeControl()
+        let took = seizeControl() || activeProfile.isCustom
         activeProfile = .smart
         persistSelectedProfile(FanProfile.smart.id)
         monitor?.switchProfile(.smart)
@@ -426,7 +624,9 @@ final class AppState: ObservableObject {
     }
 
     func selectProfile(_ profile: FanProfile) {
-        let took = seizeControl()
+        // Leaving a custom curve also needs the reset: it holds the fans at its own
+        // speed, which a built-in profile that isn't engaged would never release.
+        let took = seizeControl() || activeProfile.isCustom
         activeProfile = profile
         persistSelectedProfile(profile.id)
         monitor?.switchProfile(profile)

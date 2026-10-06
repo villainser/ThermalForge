@@ -130,6 +130,28 @@ struct MenuBarView: View {
             .labelsHidden()
             .padding(.horizontal, 12)
 
+            // Custom fan curves: an extra mode next to the built-in profiles above.
+            if !appState.customCurves.isEmpty {
+                SectionHeader(title: "CUSTOM CURVES")
+                ForEach(appState.customCurves) { curve in
+                    CustomCurveRow(
+                        curve: curve,
+                        isActive: appState.activeProfile.id == curve.id,
+                        fahrenheit: appState.useFahrenheit,
+                        select: { appState.selectCustom(curve) }
+                    )
+                }
+            }
+
+            Button(action: { CurveEditorWindow.shared.show(appState: appState) }) {
+                Label("Edit fan curves…", systemImage: "slider.horizontal.3")
+                    .font(.caption)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 12)
+            .padding(.top, 4)
+
             Divider().padding(.vertical, 4)
 
             // Quick actions
@@ -181,6 +203,9 @@ struct MenuBarView: View {
             .padding(.bottom, 10)
         }
         .frame(width: 260)
+        // Report whether this panel is really on screen, so AppState only builds and
+        // publishes the full status while someone can see it.
+        .background(PanelVisibilityReader { appState.setPanelVisible($0) })
     }
 
     // MARK: - Helpers
@@ -211,6 +236,37 @@ struct MenuBarView: View {
 }
 
 // MARK: - Subviews
+
+/// One custom curve in the profile list: tap to make it the active profile.
+private struct CustomCurveRow: View {
+    let curve: CustomFanCurve
+    let isActive: Bool
+    let fahrenheit: Bool
+    let select: () -> Void
+
+    var body: some View {
+        Button(action: select) {
+            HStack {
+                Image(systemName: isActive ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(isActive ? Color.orange : Color.secondary)
+                Text(curve.name)
+                Spacer()
+                if let first = curve.points.first, let last = curve.points.last {
+                    let unit = fahrenheit ? "F" : "C"
+                    let from = fahrenheit ? first.temp * 9 / 5 + 32 : first.temp
+                    let to = fahrenheit ? last.temp * 9 / 5 + 32 : last.temp
+                    Text("\(Int(from))→\(Int(to))°\(unit)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 2)
+    }
+}
 
 /// Banner shown when a hold was set from the CLI. Explains what's pinned and how
 /// to release it without needing to know any terminal commands.
